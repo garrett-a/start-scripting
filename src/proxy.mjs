@@ -180,25 +180,32 @@ export function startProxy(targetUrl, port = 3000) {
           if (contentType.includes('text/html')) {
             let html = responseBuffer.toString('utf8');
 
-            // Rewrite the target origin only when it appears inside an HTML
-            // attribute value (preceded by =" or =') — this avoids breaking
-            // JS regex literals that contain the origin as a string.
-            // Split on <script>...</script> blocks so we never rewrite inside
-            // inline scripts (which would corrupt the JS and cause it to render
-            // as visible text in the browser).
+            // Process HTML in segments, skipping <script>...</script> blocks.
+            //
+            // Two operations must only touch real HTML markup, never inline JS:
+            //   1. URL rewriting — the origin may appear as a string literal
+            //      inside a polyfill script, and rewriting it there can break
+            //      the JS and cause the rest of the script to render as text.
+            //   2. </body> injection — polyfills often write a full HTML doc
+            //      into an iframe (r.write('...<body></body>...')), so the
+            //      first </body> in the raw text may be inside a script string,
+            //      not the real closing tag.
             const escapedOrigin = targetOrigin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const originRe = new RegExp(`(=["'])${escapedOrigin}`, 'gi');
             const scriptRe = /(<script[\s\S]*?<\/script>)/gi;
-            html = html.split(scriptRe).map((part, i) =>
-              i % 2 === 0 ? part.replace(originRe, `$1${localOrigin}`) : part
-            ).join('');
 
-            // Inject our snippet just before the closing </body> tag
-            if (/<\/body>/i.test(html)) {
-              html = html.replace(/<\/body>/i, INJECT_SNIPPET + '\n</body>');
-            } else {
-              html += INJECT_SNIPPET;
-            }
+            let injected = false;
+            html = html.split(scriptRe).map((part, i) => {
+              if (i % 2 !== 0) return part; // inside a script block — leave untouched
+              let out = part.replace(originRe, `$1${localOrigin}`);
+              if (!injected && /<\/body>/i.test(out)) {
+                out = out.replace(/<\/body>/i, INJECT_SNIPPET + '\n</body>');
+                injected = true;
+              }
+              return out;
+            }).join('');
+
+            if (!injected) html += INJECT_SNIPPET;
             return html;
           }
 
