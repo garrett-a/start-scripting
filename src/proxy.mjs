@@ -138,11 +138,21 @@ export function startProxy(targetUrl, port = 3000) {
            */
           const location = proxyRes.headers['location'];
           if (location) {
-            const targetOrigin = new URL(targetUrl).origin;
-            if (location.startsWith(targetOrigin) || location.startsWith('/')) {
-              proxyRes.headers['location'] = location.startsWith('/')
-                ? `http://localhost:${port}${location}`
-                : location.replace(targetOrigin, `http://localhost:${port}`);
+            if (location.startsWith('/')) {
+              // Relative redirect — prepend localhost origin
+              proxyRes.headers['location'] = `http://localhost:${port}${location}`;
+            } else {
+              try {
+                // Absolute redirect — swap whatever host/protocol is there with
+                // localhost so the browser stays on the proxy. This handles
+                // redirects to subdomains, www variants, or http↔https flips.
+                const u = new URL(location);
+                u.protocol = 'http:';
+                u.host = `localhost:${port}`;
+                proxyRes.headers['location'] = u.toString();
+              } catch (_) {
+                // Malformed URL — leave it alone
+              }
             }
           }
 
