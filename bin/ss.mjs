@@ -202,9 +202,14 @@ program
     screenshot.png  ← open in IDE to see the page visually
     page.md         ← reference when prompting your AI assistant
 
-  INSTALL / UPDATE
-  ─────────────────
-  npm install -g github:garrett-a/start-scripting
+  INSTALL
+  ───────
+  git clone https://github.com/garrett-a/start-scripting.git ~/.ss
+  cd ~/.ss && npm install && npm link
+
+  UPDATE
+  ──────
+  cd ~/.ss && git pull && npm install
 `);
   });
 

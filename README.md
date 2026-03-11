@@ -14,10 +14,13 @@ Local dev tool for building A/B tests on live websites. Write test code in your 
 Requires [Node.js](https://nodejs.org) v18+.
 
 ```bash
-npm install -g github:garrett-a/start-scripting
+git clone https://github.com/garrett-a/start-scripting.git ~/.ss
+cd ~/.ss
+npm install
+npm link
 ```
 
-This installs the `ss` command globally and downloads the Chromium browser used for page capture (~100MB, one time).
+This installs the `ss` command globally. The first time you run `ss connect`, Chromium will be downloaded automatically (~100MB, one time).
 
 ## Quickstart
 
