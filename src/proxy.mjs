@@ -118,6 +118,13 @@ export function startProxy(targetUrl, port = 3000) {
          * function so we can inspect and modify it before sending to the browser.
          */
         proxyRes: responseInterceptor(async (responseBuffer, proxyRes, req, res) => {
+          const status = proxyRes.statusCode;
+          const loc = proxyRes.headers['location'];
+          if (loc) {
+            console.log(`  [${status}] ${req.url} → ${loc}`);
+          } else {
+            console.log(`  [${status}] ${req.url}`);
+          }
           /**
            * Rewrite redirect Location headers to stay on the proxy.
            *
