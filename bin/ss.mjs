@@ -150,6 +150,64 @@ program
     await buildAll();
   });
 
+// ─── ss man ───────────────────────────────────────────────────────────────────
+
+program
+  .command('man')
+  .description('Show the full command reference')
+  .action(() => {
+    console.log(`
+  ┌─────────────────────────────────────────────────────┐
+  │                  ss — start-scripting                │
+  │        A/B test dev tool for live websites           │
+  └─────────────────────────────────────────────────────┘
+
+  WORKFLOW
+  ────────
+  1. ss connect <url> --test <name>
+       Proxy starts at localhost:3000 mirroring the live site.
+       Page context saved to ss-context/ for your AI assistant.
+
+  2. Edit tests/<name>/variation.js
+       Write plain JS — no wrapper needed. Save to rebuild.
+
+  3. Ask your AI (Copilot, Cursor, Claude, etc.):
+       "Based on ss-context/page.md, add a sticky bar..."
+       Paste the output into variation.js.
+
+  4. ss build  →  dist/<name>.js
+       Paste into Optimizely / VWO / Convert to go live.
+
+  COMMANDS
+  ────────
+  ss connect <url>               Start proxy + watcher
+    --test, -t <name>            Test to use (auto-created if missing)
+    --port, -p <number>          Port to run on (default: 3000)
+
+  ss new <test-name>             Scaffold a new test folder
+  ss list                        Show all tests, mark active one
+  ss build                       Bundle all tests to dist/ (minified)
+  ss man                         Show this reference
+
+  TEST FOLDER
+  ───────────
+  tests/<name>/
+    variation.js    ← your code (edit this)
+    index.css       ← your styles (edit this)
+    index.js        ← boilerplate (do not edit)
+
+  CONTEXT FILES (auto-generated on connect)
+  ──────────────────────────────────────────
+  ss-context/
+    screenshot.png  ← open in IDE to see the page visually
+    page.md         ← reference when prompting your AI assistant
+
+  INSTALL / UPDATE
+  ─────────────────
+  npm install -g github:garrett-a/start-scripting
+`);
+  });
+
 // ─── Parse and run ────────────────────────────────────────────────────────────
 
 program.parse();
