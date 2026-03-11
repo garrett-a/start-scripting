@@ -166,12 +166,16 @@ export function startProxy(targetUrl, port = 3000) {
           if (contentType.includes('text/html')) {
             let html = responseBuffer.toString('utf8');
 
+            // Rewrite absolute URLs pointing to the target origin so all
+            // requests stay on the proxy (avoids HSTS and direct connections)
+            const targetOrigin = new URL(targetUrl).origin;
+            const localOrigin = `http://localhost:${port}`;
+            html = html.split(targetOrigin).join(localOrigin);
+
             // Inject our snippet just before the closing </body> tag
-            // The /i flag makes the regex case-insensitive (handles </BODY> too)
-            if (html.includes('</body>') || html.match(/<\/body>/i)) {
+            if (/<\/body>/i.test(html)) {
               html = html.replace(/<\/body>/i, INJECT_SNIPPET + '\n</body>');
             } else {
-              // Some pages don't have </body> — append to end as a fallback
               html += INJECT_SNIPPET;
             }
             return html;
