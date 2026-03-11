@@ -161,16 +161,33 @@ export function startProxy(targetUrl, port = 3000) {
           delete proxyRes.headers['strict-transport-security'];
           delete proxyRes.headers['x-frame-options'];
 
-          // Only modify HTML responses — leave JS, CSS, images, fonts, etc. alone
+          // Fix duplicate CORS headers (e.g. "*, *") which Chrome rejects
+          if (proxyRes.headers['access-control-allow-origin']) {
+            proxyRes.headers['access-control-allow-origin'] = '*';
+          }
+
           const contentType = proxyRes.headers['content-type'] || '';
+          const targetOrigin = new URL(targetUrl).origin;
+          const localOrigin = `http://localhost:${port}`;
+
+          // Rewrite CSS responses — safe to do a full replacement since CSS
+          // has no regex literals that could break from the substitution
+          if (contentType.includes('text/css')) {
+            const css = responseBuffer.toString('utf8');
+            return css.split(targetOrigin).join(localOrigin);
+          }
+
           if (contentType.includes('text/html')) {
             let html = responseBuffer.toString('utf8');
 
-            // Rewrite absolute URLs pointing to the target origin so all
-            // requests stay on the proxy (avoids HSTS and direct connections)
-            const targetOrigin = new URL(targetUrl).origin;
-            const localOrigin = `http://localhost:${port}`;
-            html = html.split(targetOrigin).join(localOrigin);
+            // Rewrite the target origin only when it appears inside an HTML
+            // attribute value (preceded by =" or =') — this avoids breaking
+            // JS regex literals that contain the origin as a string
+            const escapedOrigin = targetOrigin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            html = html.replace(
+              new RegExp(`(=["'])${escapedOrigin}`, 'gi'),
+              `$1${localOrigin}`
+            );
 
             // Inject our snippet just before the closing </body> tag
             if (/<\/body>/i.test(html)) {
