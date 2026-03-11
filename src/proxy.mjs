@@ -182,12 +182,16 @@ export function startProxy(targetUrl, port = 3000) {
 
             // Rewrite the target origin only when it appears inside an HTML
             // attribute value (preceded by =" or =') — this avoids breaking
-            // JS regex literals that contain the origin as a string
+            // JS regex literals that contain the origin as a string.
+            // Split on <script>...</script> blocks so we never rewrite inside
+            // inline scripts (which would corrupt the JS and cause it to render
+            // as visible text in the browser).
             const escapedOrigin = targetOrigin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            html = html.replace(
-              new RegExp(`(=["'])${escapedOrigin}`, 'gi'),
-              `$1${localOrigin}`
-            );
+            const originRe = new RegExp(`(=["'])${escapedOrigin}`, 'gi');
+            const scriptRe = /(<script[\s\S]*?<\/script>)/gi;
+            html = html.split(scriptRe).map((part, i) =>
+              i % 2 === 0 ? part.replace(originRe, `$1${localOrigin}`) : part
+            ).join('');
 
             // Inject our snippet just before the closing </body> tag
             if (/<\/body>/i.test(html)) {
