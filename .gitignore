@@ -1,4 +1,5 @@
 node_modules/
 dist/
+.ss-cache/
 .env
 .ss-config.json

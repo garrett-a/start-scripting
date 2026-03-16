@@ -13,7 +13,7 @@
  */
 
 import * as esbuild from 'esbuild';
-import { writeFileSync, mkdirSync, readdirSync, statSync, existsSync } from 'fs';
+import { writeFileSync, readFileSync, mkdirSync, readdirSync, statSync, existsSync, watch } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -76,14 +76,14 @@ function reloadSignalPlugin(distDir) {
  */
 export async function startBuilder(testName) {
   const projectDir = process.cwd();
-  const entryPoint = join(projectDir, 'tests', testName, 'index.js');
+  const entryPoint = join(projectDir, '.ss-cache', `${testName}.js`);
   const distDir = join(projectDir, 'dist');
   const outfile = join(distDir, 'bundle.js');
 
   mkdirSync(distDir, { recursive: true });
 
   if (!existsSync(entryPoint)) {
-    console.error(`✖ No test found at tests/${testName}/index.js`);
+    console.error(`✖ No cache entry found for "${testName}". Run "ss new ${testName}" first.`);
     process.exit(1);
   }
 
@@ -101,6 +101,33 @@ export async function startBuilder(testName) {
 
   await ctx.rebuild();
   await ctx.watch();
+
+  // Watch the variation directory for added/removed files so new scripts
+  // and stylesheets are picked up automatically without restarting.
+  const { writeCacheEntry } = await import('./scaffold.mjs');
+  const configPath = join(projectDir, '.ss-config.json');
+  let activeVariation = 'v1';
+  try {
+    activeVariation = JSON.parse(readFileSync(configPath, 'utf8')).activeVariation || 'v1';
+  } catch {}
+
+  const variationDir = join(projectDir, 'tests', testName, activeVariation);
+  let knownFiles = new Set(readdirSync(variationDir));
+  let debounceTimer;
+
+  watch(variationDir, { persistent: false }, () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      const currentFiles = new Set(readdirSync(variationDir));
+      // Only regenerate the cache entry when files are added or removed
+      if (currentFiles.size !== knownFiles.size ||
+          [...currentFiles].some((f) => !knownFiles.has(f))) {
+        writeCacheEntry(testName, activeVariation);
+        knownFiles = currentFiles;
+        console.log(`  ↻ File list changed — updated imports`);
+      }
+    }, 200);
+  });
 
   console.log(`✔ Watching tests/${testName}/`);
 }
@@ -130,9 +157,11 @@ export async function buildAll() {
   const distDir = join(projectDir, 'dist');
   mkdirSync(distDir, { recursive: true });
 
+  const cacheDir = join(projectDir, '.ss-cache');
+
   await esbuild.build({
     entryPoints: testNames.map((name) => ({
-      in: join(testsDir, name, 'index.js'),
+      in: join(cacheDir, `${name}.js`),
       out: name,
     })),
     outdir: distDir,

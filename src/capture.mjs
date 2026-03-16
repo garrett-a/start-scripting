@@ -4,7 +4,9 @@
  * Called automatically when `ss connect` runs. Uses Playwright to visit the
  * live site and save context files to ss-context/ in the current project:
  *
- *   ss-context/screenshot.png  — visual snapshot of the page
+ *   ss-context/desktop.png     — full-page screenshot at 1440px
+ *   ss-context/tablet.png      — full-page screenshot at 768px
+ *   ss-context/mobile.png      — full-page screenshot at 375px
  *   ss-context/page.md         — HTML structure + CSS tokens in markdown,
  *                                readable by any AI assistant (Copilot, Cursor,
  *                                Claude, etc.)
@@ -54,8 +56,16 @@ export async function capturePageContext(targetUrl, testName) {
     }
   }
 
+  const viewports = [
+    { name: 'desktop', width: 1440, height: 900 },
+    { name: 'tablet',  width: 768,  height: 1024 },
+    { name: 'mobile',  width: 375,  height: 812 },
+  ];
+
   const page = await browser.newPage();
-  await page.setViewportSize({ width: 1440, height: 900 });
+
+  // Load the page once at desktop size — used for HTML + token extraction
+  await page.setViewportSize({ width: viewports[0].width, height: viewports[0].height });
 
   try {
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -66,13 +76,30 @@ export async function capturePageContext(targetUrl, testName) {
     return;
   }
 
-  // Screenshot saved as a real PNG file — AI assistants that support images
-  // (Cursor, Claude Code) can view it directly in the IDE
-  const screenshotPath = join(contextDir, 'screenshot.png');
-  await page.screenshot({ path: screenshotPath, fullPage: false });
+  // Full-page screenshots at each viewport size
+  for (const vp of viewports) {
+    await page.setViewportSize({ width: vp.width, height: vp.height });
+    await page.waitForTimeout(300); // let layout settle after resize
+    await page.screenshot({
+      path: join(contextDir, `${vp.name}.png`),
+      fullPage: true,
+    });
+    console.log(`  ✔ ${vp.name}.png (${vp.width}px)`);
+  }
 
-  // Rendered HTML after JS has run (better than raw source)
-  const html = await page.content();
+  // Extract the visible body HTML — strips scripts, styles, SVGs, and other
+  // invisible elements so the AI gets a clean view of the page structure
+  const bodyHtml = await page.evaluate(() => {
+    const clone = document.body.cloneNode(true);
+    // Remove elements that add noise without structural value
+    clone.querySelectorAll('script, style, noscript, svg, link[rel="stylesheet"], iframe')
+      .forEach((el) => el.remove());
+    // Collapse whitespace runs into single spaces for a compact output
+    return clone.innerHTML
+      .replace(/\s{2,}/g, ' ')
+      .replace(/> </g, '>\n<')
+      .trim();
+  });
 
   // CSS design tokens — extracted from the live browser environment
   const tokens = await page.evaluate(() => {
@@ -113,15 +140,19 @@ export async function capturePageContext(targetUrl, testName) {
     `# Page Context: ${pageTitle}`,
     ``,
     `**URL:** ${targetUrl}`,
-    `**Active test:** tests/${testName}/variation.js`,
-    `**Screenshot:** ss-context/screenshot.png`,
+    `**Active test:** tests/${testName}/`,
+    ``,
+    `## Screenshots`,
+    `- **Desktop (1440px):** ss-context/desktop.png`,
+    `- **Tablet (768px):** ss-context/tablet.png`,
+    `- **Mobile (375px):** ss-context/mobile.png`,
     ``,
     `## How to use this file`,
     `Ask your AI assistant (Copilot, Cursor, Claude, etc.):`,
     `> "Based on the context in ss-context/page.md, [what you want to build]"`,
     ``,
-    `Then paste the generated JS into \`tests/${testName}/variation.js\``,
-    `and the CSS into \`tests/${testName}/index.css\`.`,
+    `Then paste the generated JS into \`tests/${testName}/v1/variation.js\``,
+    `and the CSS into \`tests/${testName}/v1/index.css\`.`,
     `The proxy will rebuild and show the change on the live site automatically.`,
     ``,
     `## CSS Design Tokens`,
@@ -129,15 +160,15 @@ export async function capturePageContext(targetUrl, testName) {
     cssTokenLines || '(none found)',
     `\`\`\``,
     ``,
-    `## Page HTML (first 8000 chars)`,
+    `## Page Body`,
     `\`\`\`html`,
-    html.slice(0, 8000),
+    bodyHtml,
     `\`\`\``,
   ].join('\n');
 
   writeFileSync(join(contextDir, 'page.md'), md);
 
   console.log(`✔ Context saved to ss-context/`);
-  console.log(`  screenshot.png — open in your IDE to see the page visually`);
-  console.log(`  page.md        — reference this file when prompting your AI\n`);
+  console.log(`  desktop.png, tablet.png, mobile.png — full-page screenshots`);
+  console.log(`  page.md — reference this file when prompting your AI\n`);
 }

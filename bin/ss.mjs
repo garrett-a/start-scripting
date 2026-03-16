@@ -8,7 +8,7 @@
  */
 
 import { program } from 'commander';
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, cpSync } from 'fs';
 import { join } from 'path';
 import { exec } from 'child_process';
 
@@ -49,7 +49,7 @@ program
     scaffoldTest(testName);
 
     const config = loadConfig();
-    saveConfig({ ...config, activeTest: testName });
+    saveConfig({ ...config, activeTest: testName, activeVariation: 'v1' });
   });
 
 // ─── ss connect <url> ─────────────────────────────────────────────────────────
@@ -71,6 +71,19 @@ program
 
     const port = parseInt(options.port, 10);
 
+    // Follow redirects to find the canonical URL (e.g. opb.org → www.opb.org)
+    try {
+      const res = await fetch(url, { method: 'HEAD', redirect: 'follow' });
+      const resolved = new URL(res.url);
+      const canonical = `${resolved.protocol}//${resolved.host}`;
+      if (canonical !== new URL(url).origin) {
+        console.log(`\n  ↳ ${url} redirects to ${canonical} — using that instead`);
+        url = canonical;
+      }
+    } catch (_) {
+      // Network error — proceed with the original URL
+    }
+
     // Auto-create the test folder if it doesn't exist yet
     const testDir = join(process.cwd(), 'tests', testName);
     if (!existsSync(testDir)) {
@@ -78,10 +91,12 @@ program
       scaffoldTest(testName);
     }
 
-    saveConfig({ ...config, activeTest: testName, targetUrl: url });
+    const activeVariation = config.activeVariation || 'v1';
+    saveConfig({ ...config, activeTest: testName, activeVariation, targetUrl: url });
 
-    console.log(`\n  Active test : tests/${testName}/`);
-    console.log(`  Target URL  : ${url}`);
+    console.log(`\n  Active test      : tests/${testName}/`);
+    console.log(`  Active variation : ${activeVariation}`);
+    console.log(`  Target URL       : ${url}`);
 
     const { startBuilder } = await import('../src/builder.mjs');
     const { startProxy } = await import('../src/proxy.mjs');
@@ -98,7 +113,7 @@ program
     const openCmd = process.platform === 'darwin' ? 'open' : 'xdg-open';
     exec(`${openCmd} http://localhost:${port}`);
 
-    console.log('  Edit tests/' + testName + '/variation.js to write your test.');
+    console.log(`  Edit tests/${testName}/${activeVariation}/variation.js to write your test.`);
     console.log('  Ask your AI: "Based on ss-context/page.md, [what you want]"');
     console.log('  Press Ctrl+C to stop.\n');
 
@@ -140,6 +155,67 @@ program
     console.log('');
   });
 
+// ─── ss variation ─────────────────────────────────────────────────────────────
+
+program
+  .command('variation')
+  .description('Create a new variation for the active test and switch to it')
+  .action(async () => {
+    const config = loadConfig();
+    if (!config.activeTest) {
+      console.error('✖ No active test. Run "ss new <name>" first.');
+      process.exit(1);
+    }
+
+    const testDir = join(process.cwd(), 'tests', config.activeTest);
+    if (!existsSync(testDir)) {
+      console.error(`✖ Test folder not found: tests/${config.activeTest}/`);
+      process.exit(1);
+    }
+
+    // Find the highest existing v# folder and increment
+    const existing = readdirSync(testDir).filter(
+      (n) => /^v\d+$/.test(n) && statSync(join(testDir, n)).isDirectory()
+    );
+    const nums = existing.map((n) => parseInt(n.slice(1), 10));
+    const nextNum = nums.length > 0 ? Math.max(...nums) + 1 : 2;
+    const nextVariation = `v${nextNum}`;
+    const currentVariation = config.activeVariation || 'v1';
+
+    // Copy current variation folder to new variation
+    cpSync(join(testDir, currentVariation), join(testDir, nextVariation), { recursive: true });
+
+    // Rewrite the hidden cache entry to point to the new variation
+    const { writeCacheEntry } = await import('../src/scaffold.mjs');
+    writeCacheEntry(config.activeTest, nextVariation);
+
+    saveConfig({ ...config, activeVariation: nextVariation });
+
+    console.log(`✔ Created tests/${config.activeTest}/${nextVariation}/ (copied from ${currentVariation})`);
+    console.log(`  Now active: ${nextVariation}`);
+    console.log(`  Edit tests/${config.activeTest}/${nextVariation}/variation.js`);
+  });
+
+// ─── ss capture ───────────────────────────────────────────────────────────────
+
+program
+  .command('capture [url]')
+  .description('Re-capture page context (screenshots + HTML) for the target site')
+  .action(async (url) => {
+    const config = loadConfig();
+    const targetUrl = url || config.targetUrl;
+
+    if (!targetUrl) {
+      console.error('✖ No URL specified and no previous target found.');
+      console.error('  Usage: ss capture <url>  or  run ss connect first.');
+      process.exit(1);
+    }
+
+    const testName = config.activeTest || 'unknown';
+    const { capturePageContext } = await import('../src/capture.mjs');
+    await capturePageContext(targetUrl, testName);
+  });
+
 // ─── ss build ─────────────────────────────────────────────────────────────────
 
 program
@@ -168,7 +244,7 @@ program
        Proxy starts at localhost:3000 mirroring the live site.
        Page context saved to ss-context/ for your AI assistant.
 
-  2. Edit tests/<name>/variation.js
+  2. Edit tests/<name>/v1/variation.js
        Write plain JS — no wrapper needed. Save to rebuild.
 
   3. Ask your AI (Copilot, Cursor, Claude, etc.):
@@ -185,6 +261,8 @@ program
     --port, -p <number>          Port to run on (default: 3000)
 
   ss new <test-name>             Scaffold a new test folder
+  ss variation                   Create a new variation for the active test
+  ss capture [url]               Re-capture page context (screenshots + HTML)
   ss list                        Show all tests, mark active one
   ss build                       Bundle all tests to dist/ (minified)
   ss man                         Show this reference
@@ -192,15 +270,18 @@ program
   TEST FOLDER
   ───────────
   tests/<name>/
-    variation.js    ← your code (edit this)
-    index.css       ← your styles (edit this)
-    index.js        ← boilerplate (do not edit)
+    v1/
+      variation.js  ← your code (edit this)
+      index.css     ← your styles (edit this)
+      index.html    ← optional HTML injected before </body>
 
-  CONTEXT FILES (auto-generated on connect)
-  ──────────────────────────────────────────
+  CONTEXT FILES (auto-generated on connect, refreshed with ss capture)
+  ────────────────────────────────────────────────────────────────────
   ss-context/
-    screenshot.png  ← open in IDE to see the page visually
-    page.md         ← reference when prompting your AI assistant
+    desktop.png  ← full-page screenshot at 1440px
+    tablet.png   ← full-page screenshot at 768px
+    mobile.png   ← full-page screenshot at 375px
+    page.md      ← reference when prompting your AI assistant
 
   INSTALL
   ───────
