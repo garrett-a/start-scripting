@@ -97,6 +97,11 @@ program
       scaffoldTest(testName);
     }
 
+    // Split URL into origin (for proxy target) and path (for browser + capture)
+    const parsedUrl = new URL(url);
+    const targetOrigin = parsedUrl.origin;
+    const targetPath = parsedUrl.pathname + parsedUrl.search;
+
     const activeVariation = config.activeVariation || 'v1';
     saveConfig({ ...config, activeTest: testName, activeVariation, targetUrl: url });
 
@@ -109,15 +114,16 @@ program
     const { capturePageContext } = await import('../src/capture.mjs');
 
     // Start proxy + builder, then capture page context in parallel
+    // Proxy gets origin only — request paths are appended by http-proxy
     await Promise.all([
       startBuilder(testName),
-      startProxy(url, port),
+      startProxy(targetOrigin, port),
       capturePageContext(url, testName),
     ]);
 
-    // Open the proxied site in the default browser
+    // Open the proxied site at the original path
     const openCmd = process.platform === 'darwin' ? 'open' : 'xdg-open';
-    exec(`${openCmd} http://localhost:${port}`);
+    exec(`${openCmd} http://localhost:${port}${targetPath}`);
 
     console.log(`  Edit tests/${testName}/${activeVariation}/variation.js to write your test.`);
     console.log('  Ask your AI: "Based on ss-context/page.md, [what you want]"');
