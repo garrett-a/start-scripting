@@ -113,6 +113,7 @@ export async function startBuilder(testName) {
   } catch {}
 
   const variationDir = join(projectDir, 'tests', testName, activeVariation);
+  console.log(`  [debug] Polling directory: ${variationDir}`);
 
   function getSnapshot() {
     const files = readdirSync(variationDir);
@@ -124,6 +125,7 @@ export async function startBuilder(testName) {
   }
 
   let lastSnapshot = getSnapshot();
+  console.log(`  [debug] Initial snapshot:`, JSON.stringify(lastSnapshot));
 
   setInterval(async () => {
     const current = getSnapshot();
@@ -135,6 +137,7 @@ export async function startBuilder(testName) {
       currentKeys.some((f) => lastSnapshot[f] !== current[f]);
 
     if (!changed) return;
+    console.log(`  [debug] Change detected:`, JSON.stringify(current));
 
     // Regenerate cache entry if files were added or removed
     if (currentKeys.length !== lastKeys.length ||
