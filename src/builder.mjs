@@ -70,6 +70,24 @@ function reloadSignalPlugin(distDir) {
 }
 
 /**
+ * Shared build options — used by both the watcher and one-off builds.
+ */
+function buildOptions(entryPoint, projectDir, outfile, distDir) {
+  return {
+    entryPoints: [entryPoint],
+    absWorkingDir: projectDir,
+    outfile,
+    bundle: true,
+    format: 'iife',
+    sourcemap: true,
+    plugins: [
+      cssInjectorPlugin(),
+      reloadSignalPlugin(distDir),
+    ],
+  };
+}
+
+/**
  * Start the esbuild watcher for a single test.
  * Uses process.cwd() so it works from any project directory.
  *
@@ -88,24 +106,12 @@ export async function startBuilder(testName) {
     process.exit(1);
   }
 
-  const ctx = await esbuild.context({
-    entryPoints: [entryPoint],
-    absWorkingDir: projectDir,
-    outfile,
-    bundle: true,
-    format: 'iife',  // wraps everything in a function — keeps variables off the global scope
-    sourcemap: true,
-    plugins: [
-      cssInjectorPlugin(),
-      reloadSignalPlugin(distDir),
-    ],
-  });
+  // Initial build — fresh esbuild.build() so files are always read from disk
+  await esbuild.build(buildOptions(entryPoint, projectDir, outfile, distDir));
 
-  await ctx.rebuild();
-
-  // esbuild's built-in ctx.watch() and fs.watch() don't reliably detect
-  // file changes on all systems. Poll file mtimes instead — checks every
-  // 500ms, only rebuilds when something actually changed.
+  // Poll file mtimes every 500ms and do a fresh build when anything changes.
+  // We use esbuild.build() (not ctx.rebuild()) because the incremental context
+  // caches file contents and doesn't reliably pick up changes on all systems.
   const { writeCacheEntry } = await import('./scaffold.mjs');
   const configPath = join(projectDir, '.ss-config.json');
   let activeVariation = 'v1';
@@ -142,15 +148,15 @@ export async function startBuilder(testName) {
     if (!changed) return;
     console.log(`  [debug] Change detected:`, JSON.stringify(current));
 
-    // Regenerate cache entry so esbuild sees a changed entry point
+    // Regenerate cache entry in case files were added or removed
     writeCacheEntry(testName, activeVariation);
 
     lastSnapshot = current;
     rebuilding = true;
     try {
-      await ctx.rebuild();
+      await esbuild.build(buildOptions(entryPoint, projectDir, outfile, distDir));
     } catch (err) {
-      console.error(`  ✖ Rebuild error:`, err.message);
+      console.error(`  ✖ Build error:`, err.message);
     } finally {
       rebuilding = false;
     }
