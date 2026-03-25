@@ -208,9 +208,13 @@ program
       // is NOT set and Cloudflare treats it as a real browser.
       await cdpContext.addInitScript(`
         document.addEventListener('DOMContentLoaded', () => {
+          console.log('[ss] Injecting test bundle from localhost:${port}...');
+
           // Load the A/B test bundle
           var s = document.createElement('script');
           s.src = 'http://localhost:${port}/__ss__/bundle.js';
+          s.onload = function() { console.log('[ss] Bundle loaded ✔'); };
+          s.onerror = function() { console.error('[ss] Bundle failed to load — check CORS / server'); };
           document.head.appendChild(s);
 
           // Livereload: poll for rebuilds
@@ -227,19 +231,22 @@ program
         });
       `);
 
+      // Start local server FIRST so /__ss__/* is ready before the page loads
+      await startProxy(targetOrigin, port, { localOnly: true });
+
       // NOW navigate to the target — init script is already registered
       console.log('  ✔ CDP ready — navigating to target...');
       await cdpPage.goto(url, { waitUntil: 'commit' }).catch(() => {});
-      console.log('  ℹ Solve the security check in Chrome — your test loads automatically after.\n');
 
-      // Start local server for /__ss__/* + builder + capture in parallel
+      // Start builder + capture in parallel
       await Promise.all([
         startBuilder(testName),
-        startProxy(targetOrigin, port, { localOnly: true }),
         capturePageContext(url, testName),
       ]);
 
-      // Chrome is already open — don't open localhost
+      // In CDP mode the user works in the Chrome window, not localhost
+      console.log(`\n  ★ Work in the Chrome window that opened (not localhost).`);
+      console.log(`    Your scripts inject automatically on every page load.`);
       console.log(`  Edit tests/${testName}/${activeVariation}/variation.js to write your test.`);
       console.log('  Ask your AI: "Based on ss-context/page.md, [what you want]"');
       console.log('  Press Ctrl+C to stop.\n');
