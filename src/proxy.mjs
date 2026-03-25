@@ -183,25 +183,18 @@ function injectIntoHtml(html, targetOrigin, localOrigin) {
  *
  * @param {string} targetUrl    - The live site to mirror (e.g. "https://client.com")
  * @param {number} port         - Local port to run on (default 3000)
- * @param {object|null} browser - A Playwright browser context for Cloudflare-protected sites.
- *                                When provided, HTML pages are fetched through the browser's
- *                                network stack (real TLS fingerprint) instead of Node's http.
- * @returns {Promise<void>}     - Resolves once the server is up and listening
+ * @param {object|null} fetcherPage - A Playwright page that has already passed Cloudflare's
+ *                                   challenge. When provided, all proxy requests are fetched
+ *                                   through this page's fetch() (real TLS fingerprint).
+ * @returns {Promise<void>}        - Resolves once the server is up and listening
  */
-export async function startProxy(targetUrl, port = 3000, browser = null) {
+export async function startProxy(targetUrl, port = 3000, fetcherPage = null) {
   const app = express();
 
   const targetOrigin = new URL(targetUrl).origin;
   const localOrigin = `http://localhost:${port}`;
 
-  // If we have a Playwright browser context, create a persistent "fetcher" page.
-  // All proxy requests will be routed through this page's fetch() so they use
-  // the browser's TLS fingerprint and cookies — passing Cloudflare.
-  let fetcherPage = null;
-  if (browser) {
-    fetcherPage = await browser.newPage();
-    // Navigate once to set the page's origin (needed for same-origin fetch)
-    await fetcherPage.goto(targetUrl, { waitUntil: "load", timeout: 30000 });
+  if (fetcherPage) {
     console.log("  ✔ Browser-based proxy active (Cloudflare bypass)");
   }
 
@@ -265,68 +258,100 @@ export async function startProxy(targetUrl, port = 3000, browser = null) {
   /**
    * MIDDLEWARE: Browser-based proxy (for Cloudflare-protected sites)
    *
-   * When a Playwright browser context is available, we fetch pages through
-   * the browser's own fetch() API inside page.evaluate(). This uses the
-   * browser's real TLS fingerprint and cookies, which Cloudflare accepts.
+   * Cloudflare allows full browser navigations (page.goto) but blocks
+   * programmatic fetch() calls, even from within the same page. So:
    *
-   * Falls through to http-proxy-middleware if no browser context is set.
+   *   - HTML pages: use page.goto() → page.content() to get the rendered DOM
+   *   - Sub-resources (CSS, JS, images): redirect the user's real browser to
+   *     load them directly from the live domain. A <base href> tag makes all
+   *     relative URLs resolve to the live domain automatically.
+   *
+   * A click interceptor keeps navigation on localhost so links still work.
    */
   if (fetcherPage) {
+    // Serialize HTML page requests — page.goto() can't run concurrently
+    let navigating = false;
+    const navQueue = [];
+
+    function enqueueNavigation(fn) {
+      return new Promise((resolve, reject) => {
+        navQueue.push({ fn, resolve, reject });
+        if (!navigating) processQueue();
+      });
+    }
+
+    async function processQueue() {
+      if (navQueue.length === 0) { navigating = false; return; }
+      navigating = true;
+      const { fn, resolve, reject } = navQueue.shift();
+      try { resolve(await fn()); } catch (e) { reject(e); }
+      processQueue();
+    }
+
     app.use(async (req, res) => {
+      const accept = req.headers["accept"] || "";
       const fullUrl = targetOrigin + req.url;
-      console.log(`  [browser] ${req.method} ${req.url}`);
-      try {
-        const result = await fetcherPage.evaluate(
-          async ({ url, method }) => {
-            const resp = await fetch(url, {
-              method,
-              credentials: "same-origin",
-              redirect: "follow",
-            });
-            const headers = {};
-            resp.headers.forEach((v, k) => { headers[k] = v; });
-            const buf = await resp.arrayBuffer();
-            const bytes = new Uint8Array(buf);
-            let binary = "";
-            for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-            return { status: resp.status, headers, bodyBase64: btoa(binary) };
-          },
-          { url: fullUrl, method: req.method },
-        );
 
-        const body = Buffer.from(result.bodyBase64, "base64");
-        const contentType = result.headers["content-type"] || "";
+      // HTML page requests — navigate via Playwright
+      if (accept.includes("text/html")) {
+        console.log(`  [browser] ${req.url}`);
+        try {
+          const html = await enqueueNavigation(async () => {
+            await fetcherPage.goto(fullUrl, { waitUntil: "load", timeout: 30000 });
+            return await fetcherPage.content();
+          });
 
-        // Forward response headers, skipping ones we need to control
-        const skipHeaders = new Set([
-          "content-encoding", "transfer-encoding", "content-length",
-          "content-security-policy", "content-security-policy-report-only",
-          "strict-transport-security", "x-frame-options",
-        ]);
-        for (const [k, v] of Object.entries(result.headers)) {
-          if (!skipHeaders.has(k)) res.setHeader(k, v);
-        }
-        // Fix CORS
-        if (result.headers["access-control-allow-origin"]) {
-          res.setHeader("access-control-allow-origin", "*");
-        }
+          // Inject <base href> so relative URLs (images, CSS, JS) resolve to
+          // the live domain. The user's real browser fetches them directly —
+          // no proxy needed, and Cloudflare accepts real browser requests.
+          let processed = html.replace(
+            /(<head[^>]*>)/i,
+            `$1\n<base href="${targetOrigin}/">`,
+          );
 
-        if (contentType.includes("text/html")) {
-          let html = body.toString("utf8");
-          html = injectIntoHtml(html, targetOrigin, localOrigin);
-          res.setHeader("Content-Type", contentType);
-          res.status(result.status).send(html);
-        } else if (contentType.includes("text/css")) {
-          const css = body.toString("utf8").split(targetOrigin).join(localOrigin);
-          res.setHeader("Content-Type", contentType);
-          res.status(result.status).send(css);
-        } else {
-          res.status(result.status).send(body);
+          // Inject our scripts + a click interceptor that keeps <a> navigation
+          // on localhost instead of following the <base href> to the live domain.
+          const variationHtml = loadVariationHtml();
+          const clickInterceptor = `
+<script>
+  document.addEventListener('click', function(e) {
+    var a = e.target.closest('a');
+    if (!a) return;
+    var href = a.href;
+    if (href && href.startsWith('${targetOrigin}')) {
+      e.preventDefault();
+      window.location.href = href.replace('${targetOrigin}', '${localOrigin}');
+    }
+  }, true);
+</script>`;
+          const fullSnippet =
+            (variationHtml ? variationHtml + "\n" : "") +
+            INJECT_SNIPPET + "\n" + clickInterceptor;
+
+          if (/<\/body>/i.test(processed)) {
+            processed = processed.replace(/<\/body>/i, fullSnippet + "\n</body>");
+          } else {
+            processed += fullSnippet;
+          }
+
+          res.setHeader("Content-Type", "text/html; charset=utf-8");
+          res.setHeader("Cache-Control", "no-store");
+          // Strip security headers
+          res.removeHeader("content-security-policy");
+          res.removeHeader("strict-transport-security");
+          res.removeHeader("x-frame-options");
+          res.send(processed);
+        } catch (err) {
+          console.error(`  ✖ Navigation failed: ${err.message}`);
+          res.status(502).send(`Proxy error: ${err.message}`);
         }
-      } catch (err) {
-        console.error(`  ✖ Browser fetch failed: ${err.message}`);
-        res.status(502).send(`Proxy error: ${err.message}`);
+        return;
       }
+
+      // Non-HTML requests — redirect to the live domain so the user's real
+      // browser fetches them directly (Cloudflare trusts real browsers).
+      console.log(`  [redirect] ${req.url}`);
+      res.redirect(302, fullUrl);
     });
   } else {
     /**

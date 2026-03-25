@@ -79,7 +79,7 @@ program
     // Resolve redirects and detect bot protection (Cloudflare, etc.)
     // If the site has bot protection, we keep a Playwright browser alive and
     // route all proxy requests through it (real TLS fingerprint).
-    let browserContext = null;
+    let fetcherPage = null;
     try {
       const { chromium } = await import('playwright');
       console.log('\n  Checking for bot protection...');
@@ -123,11 +123,11 @@ program
       }
 
       if (isChallenge) {
-        // Keep the browser alive — proxy will fetch through it
-        browserContext = context;
+        // Keep the page alive — it already passed Cloudflare's challenge.
+        // The proxy will use this exact page for fetch() calls so they
+        // inherit the cleared challenge state and TLS fingerprint.
+        fetcherPage = page;
         console.log('  ✔ Bot protection bypassed — browser will stay open for proxying');
-        // Close the extra page (proxy.mjs will create its own fetcher page)
-        await page.close();
       } else {
         // No challenge — close the browser, use normal http-proxy
         await browser.close();
@@ -164,7 +164,7 @@ program
     // Proxy gets origin only — request paths are appended by http-proxy
     await Promise.all([
       startBuilder(testName),
-      startProxy(targetOrigin, port, browserContext),
+      startProxy(targetOrigin, port, fetcherPage),
       capturePageContext(url, testName),
     ]);
 
