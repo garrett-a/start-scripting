@@ -197,6 +197,16 @@ export async function startProxy(targetUrl, port = 3000, { localOnly = false } =
   const localOrigin = `http://localhost:${port}`;
   const INJECT_SNIPPET = buildInjectSnippet(localOrigin);
 
+  // Allow cross-origin requests to /__ss__/* endpoints.
+  // In CDP mode, the page runs on the real domain (e.g. https://example.com)
+  // and fetches bundle/livereload from http://localhost — CORS is required.
+  app.use("/__ss__", (req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Private-Network", "true");
+    if (req.method === "OPTIONS") return res.sendStatus(204);
+    next();
+  });
+
   /**
    * ROUTE 1: Serve the compiled bundle
    */
