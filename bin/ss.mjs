@@ -162,7 +162,26 @@ program
       }
 
       const debugPort = 9222;
-      const userDataDir = join(tmpdir(), `ss-chrome-${Date.now()}`);
+
+      // Use the user's real Chrome profile so they get their cookies,
+      // extensions, and bookmarks. Requires Chrome to not already be running.
+      const homeDir = await import('os').then(os => os.homedir());
+      const defaultProfile = join(homeDir, 'Library', 'Application Support', 'Google', 'Chrome');
+
+      // Check if Chrome is already running
+      let chromeRunning = false;
+      try {
+        const { execSync: execSyncFn } = await import('child_process');
+        const ps = execSyncFn('pgrep -x "Google Chrome"', { encoding: 'utf8' }).trim();
+        chromeRunning = ps.length > 0;
+      } catch {}
+
+      if (chromeRunning) {
+        console.error('\n  ✖ Chrome is already running.');
+        console.error('    CDP mode needs to launch Chrome with debugging enabled.');
+        console.error('    Please close Chrome and run this command again.\n');
+        process.exit(1);
+      }
 
       console.log('  Launching Chrome with DevTools protocol...');
 
@@ -171,7 +190,7 @@ program
       // otherwise the first page load misses our injections.
       const chromeProc = spawnProcess(chromePath, [
         `--remote-debugging-port=${debugPort}`,
-        `--user-data-dir=${userDataDir}`,
+        `--user-data-dir=${defaultProfile}`,
         '--no-first-run',
         '--no-default-browser-check',
         'about:blank',
@@ -207,6 +226,10 @@ program
       // Since Chrome was launched normally (not by Playwright), navigator.webdriver
       // is NOT set and Cloudflare treats it as a real browser.
       await cdpContext.addInitScript(`
+        // Only inject in the top-level frame — skip iframes (wufoo, recaptcha, etc.)
+        // to avoid CORS/PNA errors from cross-origin embedded frames.
+        if (window !== window.top) return;
+
         document.addEventListener('DOMContentLoaded', () => {
           console.log('[ss] Injecting test bundle from localhost:${port}...');
 
