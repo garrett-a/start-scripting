@@ -151,6 +151,13 @@ function buildInjectSnippet(ssOrigin) {
  * inline JS that contains URL strings or </body> literals.
  */
 function injectIntoHtml(html, targetOrigin, localOrigin, INJECT_SNIPPET) {
+  // Strip <meta> CSP tags — some sites deliver CSP this way
+  // in addition to (or instead of) HTTP headers
+  html = html.replace(
+    /<meta[^>]*http-equiv\s*=\s*["']Content-Security-Policy(?:-Report-Only)?["'][^>]*>/gi,
+    "",
+  );
+
   const escapedOrigin = targetOrigin.replace(
     /[.*+?^${}()|[\]\\]/g,
     "\\$&",
