@@ -310,6 +310,23 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
     });
   } else {
     /**
+     * Strip security headers from every proxied response.
+     * Hooks into writeHead so headers are removed no matter when
+     * http-proxy-middleware copies them to the outgoing response.
+     */
+    app.use((req, res, next) => {
+      const origWriteHead = res.writeHead.bind(res);
+      res.writeHead = function (statusCode, ...args) {
+        res.removeHeader("content-security-policy");
+        res.removeHeader("content-security-policy-report-only");
+        res.removeHeader("strict-transport-security");
+        res.removeHeader("x-frame-options");
+        return origWriteHead(statusCode, ...args);
+      };
+      next();
+    });
+
+    /**
      * MIDDLEWARE: Standard http-proxy-middleware (for sites without bot protection)
      */
     app.use(
@@ -343,10 +360,25 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
                 }
               }
 
+              // Debug: log CSP-related headers to verify stripping
+              const cspKeys = Object.keys(proxyRes.headers).filter(k =>
+                k.toLowerCase().includes("content-security")
+              );
+              if (cspKeys.length) {
+                console.log(`  [CSP] Found headers: ${cspKeys.join(", ")}`);
+              }
+
               delete proxyRes.headers["content-security-policy"];
               delete proxyRes.headers["content-security-policy-report-only"];
               delete proxyRes.headers["strict-transport-security"];
               delete proxyRes.headers["x-frame-options"];
+
+              // Also strip from res directly — some versions of
+              // http-proxy-middleware copy headers before our callback
+              res.removeHeader("content-security-policy");
+              res.removeHeader("content-security-policy-report-only");
+              res.removeHeader("strict-transport-security");
+              res.removeHeader("x-frame-options");
 
               if (proxyRes.headers["access-control-allow-origin"]) {
                 proxyRes.headers["access-control-allow-origin"] = "*";
