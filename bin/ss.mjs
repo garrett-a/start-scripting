@@ -103,7 +103,9 @@ program
       }
       await probe.close();
     } catch (err) {
-      console.warn(`  ⚠ Probe failed: ${err.message} — proceeding with standard proxy`);
+      // Timeouts usually mean bot protection is stalling the page load
+      usePW = true;
+      console.warn(`  ⚠ Probe failed: ${err.message} — assuming bot protection, using Playwright bypass`);
     }
 
     // Follow redirects for non-CF sites (CF sites handle this in Chrome)
