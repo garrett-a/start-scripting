@@ -8,9 +8,10 @@
  */
 
 import { program } from 'commander';
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, cpSync } from 'fs';
+import { createInterface } from 'readline';
+import { readFileSync, writeFileSync, openSync, closeSync, existsSync, readdirSync, statSync, cpSync } from 'fs';
 import { join } from 'path';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 
 // Config and tests live in the current working directory (the user's project)
 const CONFIG_FILE = join(process.cwd(), '.ss-config.json');
@@ -303,6 +304,64 @@ program
     await buildAll();
   });
 
+// ─── ss upgrade ──────────────────────────────────────────────────────────────
+
+program
+  .command('upgrade')
+  .description('Upgrade ss to the latest version from the remote repository')
+  .action(() => {
+    const toolDir = join(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), '..', '..');
+    const updaterPath = join(toolDir, 'src', 'updater.mjs');
+    const logPath     = join(toolDir, '.ss-upgrade.log');
+
+    const logFd = openSync(logPath, 'w');
+    const child = spawn(process.execPath, [updaterPath, toolDir], {
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+    });
+    child.unref();
+    closeSync(logFd);
+
+    console.log('  Upgrading in the background...');
+    console.log(`  Logs: ${logPath}`);
+    console.log('  The upgrade will print "Upgrade completed: vX.Y.Z" when done.');
+  });
+
+// ─── ss uninstall ─────────────────────────────────────────────────────────────
+
+program
+  .command('uninstall')
+  .description('Remove the ss binary and delete the installation directory')
+  .action(async () => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await new Promise(resolve =>
+      rl.question('  This will delete the ss installation directory. Type "yes" to confirm: ', resolve)
+    );
+    rl.close();
+
+    if (answer.trim().toLowerCase() !== 'yes') {
+      console.log('  Uninstall cancelled.');
+      return;
+    }
+
+    const toolDir = join(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), '..', '..');
+    const uninstallerPath = join(toolDir, 'src', 'uninstaller.mjs');
+    const logPath         = join(toolDir, '.ss-uninstall.log');
+
+    const logFd = openSync(logPath, 'w');
+    const child = spawn(process.execPath, [uninstallerPath, toolDir], {
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+    });
+    child.unref();
+    closeSync(logFd);
+
+    console.log('\n  Uninstalling ss...');
+    console.log(`  Logs: ${logPath}`);
+    console.log('  Your project directories are untouched.');
+    process.exit(0);
+  });
+
 // ─── ss man ───────────────────────────────────────────────────────────────────
 
 program
@@ -342,6 +401,8 @@ program
   ss capture [url]               Re-capture page context (screenshots + HTML)
   ss list                        Show all tests, mark active one
   ss build                       Bundle all tests to dist/ (minified)
+  ss upgrade                     Upgrade ss to the latest version
+  ss uninstall                   Remove the ss binary and installation directory
   ss man                         Show this reference
 
   TEST FOLDER
@@ -367,7 +428,16 @@ program
 
   UPDATE
   ──────
-  cd ~/.ss && git pull && npm install
+  ss upgrade
+    Downloads the latest version in the background. Logs to .ss-upgrade.log
+    in the installation directory.
+
+  UNINSTALL
+  ─────────
+  ss uninstall
+    Prompts for confirmation, then removes the global "ss" symlink and
+    deletes the installation directory. Your project directories are
+    never touched. To reinstall, clone the repo and run npm link again.
 `);
   });
 

@@ -1,5 +1,7 @@
 node_modules/
 dist/
+.vscode/
 .ss-cache/
 .env
 .ss-config.json
+*.local.*
