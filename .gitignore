@@ -3,3 +3,10 @@ dist/
 .ss-cache/
 .env
 .ss-config.json
+
+# Regenerated on every `ss connect` — developer testing artifacts
+ss-context/
+tests/Test/
+tests/new-test-demo/
+tests/new-test-demo./
+.playwright-cli/
