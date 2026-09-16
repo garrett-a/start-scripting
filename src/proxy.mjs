@@ -272,29 +272,86 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
   });
 
   if (pwFetcher) {
+    // Raw body parser — SPA POSTs (telemetry, monitoring, graphql) need
+    // their bodies forwarded verbatim. HTML GETs have no body, so this
+    // doesn't interfere with fetchPage.
+    app.use(express.raw({ type: () => true, limit: "20mb" }));
+
+    // Manifest.json is CF-mitigated on some origins even for legitimate
+    // browser fetches. Stub it with an empty manifest so the browser stops
+    // logging 403s — PWA install prompt is the only feature affected.
+    app.get("/manifest.json", (req, res) => {
+      res.setHeader("Content-Type", "application/manifest+json");
+      res.send('{"name":"ss-mirror","short_name":"ss","start_url":"/","display":"standalone"}');
+    });
+
     /**
      * MIDDLEWARE: Playwright-backed proxy (for Cloudflare-protected sites)
      *
-     * HTML requests are fetched via Playwright's real browser engine (which
-     * passes CF bot detection), then served with a <base href> so sub-resources
-     * resolve to the real domain. Non-HTML requests are 302'd to the real site
-     * so the user's browser fetches them directly (real browsers pass CF fine).
+     * HTML GETs go through pwFetcher.fetchPage — a real browser navigation
+     * that returns the raw network response body so SSR hydration payloads
+     * ($_TSR, __NEXT_DATA__, etc.) survive intact. All other requests —
+     * every method, sub-resource type, POST body — go through rawFetch,
+     * which uses the same CF-cleared browser context as raw HTTP. The
+     * browser sees everything as same-origin from localhost.
      */
+    // Headers to strip from every upstream response so the browser doesn't
+    // reapply the real site's security policy to our localhost origin.
+    const STRIP_HEADERS = new Set([
+      "content-security-policy",
+      "content-security-policy-report-only",
+      "strict-transport-security",
+      "x-frame-options",
+      "cross-origin-embedder-policy",
+      "cross-origin-opener-policy",
+      "cross-origin-resource-policy",
+      // Node's response layer sets these itself — passing them through
+      // corrupts the body (double-encoding) or breaks chunking.
+      "content-encoding",
+      "transfer-encoding",
+      "content-length",
+    ]);
+
+    // Headers to drop from the OUTGOING request before forwarding — these
+    // are hop-by-hop or would confuse the origin. We keep content-type,
+    // accept, and any custom headers the SPA set (auth tokens, csrf, etc).
+    const DROP_REQ_HEADERS = new Set([
+      "host",
+      "connection",
+      "keep-alive",
+      "proxy-authenticate",
+      "proxy-authorization",
+      "te",
+      "trailer",
+      "transfer-encoding",
+      "upgrade",
+      "content-length", // recomputed by node from data
+      // Localhost-origin metadata that would leak "this came from the mirror"
+      "origin",
+      "referer",
+    ]);
+
+    // CORS preflight — the browser sends OPTIONS for cross-origin requests,
+    // but everything is same-origin here (localhost:3000), so preflights
+    // should never actually fire. If they do, allow-all so nothing blocks.
+    app.options("*", (req, res) => {
+      res.setHeader("access-control-allow-origin", "*");
+      res.setHeader("access-control-allow-methods", "*");
+      res.setHeader("access-control-allow-headers", "*");
+      res.sendStatus(204);
+    });
+
     app.use(async (req, res) => {
       const accept = req.headers["accept"] || "";
       const fullUrl = targetOrigin + req.originalUrl;
 
-      if (accept.includes("text/html")) {
+      if (req.method === "GET" && accept.includes("text/html")) {
         try {
-          console.log(`  [PW] ${req.method} ${req.url}`);
+          console.log(`  [PW] GET ${req.url}`);
           let html = await pwFetcher.fetchPage(fullUrl);
-          // Insert <base href> so relative URLs resolve to the real domain
-          const baseTag = `<base href="${targetOrigin}/">`;
-          if (/<head[^>]*>/i.test(html)) {
-            html = html.replace(/(<head[^>]*>)/i, `$1\n${baseTag}`);
-          } else {
-            html = baseTag + "\n" + html;
-          }
+          // No <base href> — sub-resources go through localhost too (see
+          // below) so the browser treats them as same-origin. injectIntoHtml
+          // rewrites any absolute targetOrigin URLs to localhost.
           html = injectIntoHtml(html, targetOrigin, localOrigin, INJECT_SNIPPET);
           res.setHeader("Content-Type", "text/html; charset=utf-8");
           res.setHeader("Cache-Control", "no-store");
@@ -304,8 +361,36 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
           res.status(502).send("Proxy error: " + err.message);
         }
       } else {
-        // Non-HTML: redirect to real domain so browser fetches directly
-        res.redirect(302, fullUrl);
+        // Everything else: forward the exact method + headers + body to the
+        // origin through the CF-cleared context. Origin/Referer are rewritten
+        // to the target domain so the origin sees the request as if it came
+        // from the real site, not from localhost.
+        try {
+          const forwardHeaders = {};
+          for (const [k, v] of Object.entries(req.headers)) {
+            if (!DROP_REQ_HEADERS.has(k.toLowerCase())) forwardHeaders[k] = v;
+          }
+          forwardHeaders["origin"] = targetOrigin;
+          forwardHeaders["referer"] = targetOrigin + req.originalUrl;
+
+          const body = Buffer.isBuffer(req.body) && req.body.length ? req.body : undefined;
+
+          const { status, headers, body: respBody } = await pwFetcher.rawFetch(fullUrl, {
+            method: req.method,
+            headers: forwardHeaders,
+            body,
+          });
+          res.status(status);
+          for (const [key, val] of Object.entries(headers)) {
+            if (STRIP_HEADERS.has(key.toLowerCase())) continue;
+            res.setHeader(key, val);
+          }
+          res.setHeader("access-control-allow-origin", "*");
+          res.send(respBody);
+        } catch (err) {
+          console.error(`  [PW] Sub-resource fetch error ${req.method} ${req.url}:`, err.message);
+          res.status(502).send("Proxy error: " + err.message);
+        }
       }
     });
   } else {
@@ -321,6 +406,9 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
         res.removeHeader("content-security-policy-report-only");
         res.removeHeader("strict-transport-security");
         res.removeHeader("x-frame-options");
+        res.removeHeader("cross-origin-embedder-policy");
+        res.removeHeader("cross-origin-opener-policy");
+        res.removeHeader("cross-origin-resource-policy");
         return origWriteHead(statusCode, ...args);
       };
       next();
@@ -372,6 +460,9 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
               delete proxyRes.headers["content-security-policy-report-only"];
               delete proxyRes.headers["strict-transport-security"];
               delete proxyRes.headers["x-frame-options"];
+              delete proxyRes.headers["cross-origin-embedder-policy"];
+              delete proxyRes.headers["cross-origin-opener-policy"];
+              delete proxyRes.headers["cross-origin-resource-policy"];
 
               // Also strip from res directly — some versions of
               // http-proxy-middleware copy headers before our callback
@@ -379,6 +470,9 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
               res.removeHeader("content-security-policy-report-only");
               res.removeHeader("strict-transport-security");
               res.removeHeader("x-frame-options");
+              res.removeHeader("cross-origin-embedder-policy");
+              res.removeHeader("cross-origin-opener-policy");
+              res.removeHeader("cross-origin-resource-policy");
 
               if (proxyRes.headers["access-control-allow-origin"]) {
                 proxyRes.headers["access-control-allow-origin"] = "*";

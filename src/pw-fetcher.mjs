@@ -37,6 +37,31 @@ export class PwFetcher {
     this._context = null;
     this._page = null;
     this._cookies = [];
+    // Semaphore-based concurrency limit on rawFetch. Two browsers hitting
+    // the proxy in parallel (the user's visible tab + the CLI daemon)
+    // fanning out every sub-resource through one apiRequestContext will
+    // starve some requests — headers arrive but body streaming stalls,
+    // hitting the fetch timeout. Cap in-flight to a browser-realistic 6.
+    this._maxConcurrent = 6;
+    this._activeCount = 0;
+    this._waitQueue = [];
+  }
+
+  _acquireSlot() {
+    if (this._activeCount < this._maxConcurrent) {
+      this._activeCount++;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => this._waitQueue.push(resolve));
+  }
+
+  _releaseSlot() {
+    this._activeCount--;
+    const next = this._waitQueue.shift();
+    if (next) {
+      this._activeCount++;
+      next();
+    }
   }
 
   /**
@@ -158,28 +183,108 @@ export class PwFetcher {
   }
 
   /**
-   * Fetch a page by navigating the Playwright browser.
-   * Returns the full rendered HTML. If CF challenges the page,
-   * waits for it to clear before returning.
+   * Fetch a page's raw HTML through the CF-cleared browser context.
+   *
+   * Navigates the browser (so CF sees a real browser doing a real
+   * navigation — Sec-CH-UA-* client hints, Sec-Fetch-* metadata, Turnstile
+   * script execution, everything), then returns the RAW response body from
+   * the wire via response.text() — not page.content().
+   *
+   * Why not page.content(): SSR frameworks (TanStack Start's window.$_TSR,
+   * Next.js's __NEXT_DATA__, Remix's __remixContext, Nuxt's __NUXT__)
+   * inline hydration payloads as script tags in the initial HTML. The
+   * client bundle reads them on boot and often removes/clears the script
+   * node. By the time page.content() serializes the DOM, the payload is
+   * gone and the browser can't rehydrate on the mirror.
+   *
+   * Why not context.request.get: raw HTTP through the API context skips
+   * the browser layer entirely — CF's fingerprinting misses the expected
+   * client hints, sec-fetch metadata, and Turnstile refresh, so the
+   * session gets challenged even though cookies + UA are shared.
    *
    * @param {string} url - Full URL to fetch
-   * @returns {Promise<string>} The page HTML content
+   * @returns {Promise<string>} The raw HTML as served by the origin
    */
   async fetchPage(url) {
-    await this._page.goto(url, { waitUntil: "load", timeout: 30000 });
+    const response = await this._page.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: 30000,
+    });
 
-    // Check if this specific page triggered a CF challenge
+    // If the navigation landed on a CF challenge (interstitial), wait for
+    // it to clear, then fall back to page.content() — after a challenge
+    // redirect the initial response object no longer represents the final
+    // HTML. This branch is the SSR-hydration-lossy path, unavoidable in
+    // full-challenge scenarios.
     try {
       const text = await this._page.evaluate(() => document.body.innerText);
       if (CF_PATTERN.test(text)) {
-        console.warn(`  ⚠ CF challenge on ${url} — waiting for it to clear...`);
+        console.warn(
+          `  ⚠ CF challenge on ${url} — waiting for it to clear...`,
+        );
         await this._waitForChallengeToClear(10000);
+        return await this._page.content();
       }
     } catch {
       // page navigated — that's fine
     }
 
-    return await this._page.content();
+    // Happy path: return the untouched network body so hydration payloads
+    // survive intact.
+    return await response.text();
+  }
+
+  /**
+   * Raw HTTP through the CF-cleared browser context — reuses cookies,
+   * user-agent, and headers so Cloudflare treats it as the same browser
+   * session that just passed the challenge. Used by the proxy to serve
+   * sub-resources (JS/CSS/fonts/manifest, plus POSTed telemetry/monitoring
+   * calls the SPA makes) same-origin from localhost, avoiding the CORS
+   * block that a 302 to the real domain triggers.
+   *
+   * @param {string}  url                - Absolute URL to fetch
+   * @param {object}  [opts]
+   * @param {string}  [opts.method='GET'] - HTTP method
+   * @param {object}  [opts.headers]      - Extra request headers (merged over defaults)
+   * @param {Buffer|string} [opts.body]   - Request body for POST/PUT/PATCH
+   * @returns {Promise<{status: number, headers: object, body: Buffer}>}
+   */
+  async rawFetch(url, { method = "GET", headers = {}, body } = {}) {
+    await this._acquireSlot();
+    try {
+      return await this._doRawFetch(url, { method, headers, body });
+    } finally {
+      this._releaseSlot();
+    }
+  }
+
+  async _doRawFetch(url, { method, headers, body }, attempt = 1) {
+    try {
+      const resp = await this._context.request.fetch(url, {
+        method,
+        headers: {
+          "accept": "*/*",
+          "accept-language": "en-US,en;q=0.9",
+          ...headers,
+        },
+        data: body,
+        timeout: 60000,
+      });
+      const respBody = await resp.body();
+      return {
+        status: resp.status(),
+        headers: resp.headers(),
+        body: respBody,
+      };
+    } catch (err) {
+      // Retry once on transient failure (timeout, ECONNRESET). Some CF
+      // edges close idle connections; a fresh request usually succeeds.
+      const transient = /timeout|ECONNRESET|ECONNREFUSED|socket hang up/i.test(err.message);
+      if (transient && attempt === 1) {
+        return this._doRawFetch(url, { method, headers, body }, 2);
+      }
+      throw err;
+    }
   }
 
   /**

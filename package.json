@@ -15,6 +15,7 @@
     "build": "node bin/ss.mjs build"
   },
   "dependencies": {
+    "@playwright/cli": "^0.1.20",
     "commander": "^12.1.0",
     "dotenv": "^16.4.7",
     "esbuild": "^0.24.2",

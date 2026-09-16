@@ -7,12 +7,12 @@
  *   ss-context/desktop.png     — full-page screenshot at 1440px
  *   ss-context/tablet.png      — full-page screenshot at 768px
  *   ss-context/mobile.png      — full-page screenshot at 375px
- *   ss-context/page.md         — HTML structure + CSS tokens in markdown,
- *                                readable by any AI assistant (Copilot, Cursor,
- *                                Claude, etc.)
+ *   ss-context/page.md         — visual reference + pointer to `ss snapshot`
+ *                                for live DOM inspection via @playwright/cli.
  *
- * The user can then ask their IDE's AI: "Based on ss-context/page.md, add a
- * sticky bar that matches the site's colors" and paste the output into variation.js.
+ * For DOM structure / selectors, the AI runs `ss snapshot` which spawns a
+ * playwright-cli snapshot against the proxy and returns a YAML accessibility
+ * tree with `ref` IDs. Screenshots stay here for visual orientation only.
  */
 
 import { chromium } from 'playwright';
@@ -95,54 +95,8 @@ export async function capturePageContext(targetUrl, testName, { cookies } = {}) 
     console.log(`  ✔ ${vp.name}.png (${vp.width}px)`);
   }
 
-  // Extract the visible body HTML — strips scripts, styles, SVGs, and other
-  // invisible elements so the AI gets a clean view of the page structure
-  const bodyHtml = await page.evaluate(() => {
-    const clone = document.body.cloneNode(true);
-    // Remove elements that add noise without structural value
-    clone.querySelectorAll('script, style, noscript, svg, link[rel="stylesheet"], iframe')
-      .forEach((el) => el.remove());
-    // Collapse whitespace runs into single spaces for a compact output
-    return clone.innerHTML
-      .replace(/\s{2,}/g, ' ')
-      .replace(/> </g, '>\n<')
-      .trim();
-  });
-
-  // CSS design tokens — extracted from the live browser environment
-  const tokens = await page.evaluate(() => {
-    const root = getComputedStyle(document.documentElement);
-    const result = {};
-
-    for (const prop of root) {
-      if (prop.startsWith('--')) {
-        const val = root.getPropertyValue(prop).trim();
-        if (val) result[prop] = val;
-      }
-    }
-
-    const body = getComputedStyle(document.body);
-    result['_font-family']       = body.fontFamily;
-    result['_background-color']  = body.backgroundColor;
-    result['_color']             = body.color;
-
-    const el = document.querySelector('a, button');
-    if (el) {
-      const s = getComputedStyle(el);
-      result['_link-color']      = s.color;
-      result['_link-background'] = s.backgroundColor;
-    }
-
-    return result;
-  });
-
   const pageTitle = await page.title();
   await browser.close();
-
-  // Build page.md — the main context file for the AI assistant
-  const cssTokenLines = Object.entries(tokens)
-    .map(([k, v]) => `  ${k}: ${v}`)
-    .join('\n');
 
   const md = [
     `# Page Context: ${pageTitle}`,
@@ -150,33 +104,29 @@ export async function capturePageContext(targetUrl, testName, { cookies } = {}) 
     `**URL:** ${targetUrl}`,
     `**Active test:** tests/${testName}/`,
     ``,
-    `## Screenshots`,
+    `## Screenshots (visual reference)`,
     `- **Desktop (1440px):** ss-context/desktop.png`,
     `- **Tablet (768px):** ss-context/tablet.png`,
     `- **Mobile (375px):** ss-context/mobile.png`,
     ``,
-    `## How to use this file`,
-    `Ask your AI assistant (Copilot, Cursor, Claude, etc.):`,
-    `> "Based on the context in ss-context/page.md, [what you want to build]"`,
+    `## Live DOM (for selectors + interaction)`,
+    `Run \`ss snapshot\` to write a YAML accessibility tree with \`ref\` IDs to`,
+    `disk. Use those refs with \`ss click <ref>\` / \`ss fill <ref> <text>\` to`,
+    `interact with the proxied page (variation applied).`,
     ``,
-    `Then paste the generated JS into \`tests/${testName}/v1/variation.js\``,
-    `and the CSS into \`tests/${testName}/v1/index.css\`.`,
-    `The proxy will rebuild and show the change on the live site automatically.`,
+    `Full CLI surface via \`ss browser <subcommand>\` — passthrough to`,
+    `\`playwright-cli\` for anything the wrappers don't cover.`,
     ``,
-    `## CSS Design Tokens`,
-    `\`\`\``,
-    cssTokenLines || '(none found)',
-    `\`\`\``,
-    ``,
-    `## Page Body`,
-    `\`\`\`html`,
-    bodyHtml,
-    `\`\`\``,
+    `## Workflow`,
+    `1. Look at the screenshots for layout / design language.`,
+    `2. Run \`ss snapshot\` to get the DOM tree.`,
+    `3. Edit \`tests/${testName}/v1/variation.js\` — proxy rebuilds automatically.`,
+    `4. Run \`ss snapshot\` again to confirm the change.`,
   ].join('\n');
 
   writeFileSync(join(contextDir, 'page.md'), md);
 
   console.log(`✔ Context saved to ss-context/`);
-  console.log(`  desktop.png, tablet.png, mobile.png — full-page screenshots`);
-  console.log(`  page.md — reference this file when prompting your AI\n`);
+  console.log(`  desktop.png, tablet.png, mobile.png — visual reference`);
+  console.log(`  page.md — pointer to ss snapshot for live DOM\n`);
 }

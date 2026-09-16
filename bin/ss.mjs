@@ -9,11 +9,114 @@
 
 import { program } from 'commander';
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, cpSync } from 'fs';
-import { join } from 'path';
-import { exec } from 'child_process';
+import { join, dirname, basename } from 'path';
+import { exec, spawn, spawnSync } from 'child_process';
+import { fileURLToPath } from 'url';
+import { createInterface } from 'readline';
 
 // Config and tests live in the current working directory (the user's project)
 const CONFIG_FILE = join(process.cwd(), '.ss-config.json');
+
+// TOOL_DIR: the ss install location — where node_modules/.bin/playwright-cli lives
+const TOOL_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
+const CLI_BIN = join(TOOL_DIR, 'node_modules', '.bin', 'playwright-cli');
+
+// ─── Playwright CLI helpers ───────────────────────────────────────────────────
+
+function cliSessionName() {
+  const cfg = loadConfig();
+  if (cfg.cliSession) return cfg.cliSession;
+  return `ss-${basename(process.cwd()) || 'project'}`;
+}
+
+/**
+ * Run a playwright-cli subcommand scoped to the project's session.
+ * Streams stdout/stderr straight through so the caller (AI or user) sees
+ * the raw CLI output — including the YAML snapshot path.
+ *
+ * @param {string[]} args - CLI args after the session flag (e.g. ['snapshot'])
+ * @param {object}   [opts]
+ * @param {boolean}  [opts.raw] - Skip the -s=<session> prefix (for `list`, `show`, etc.)
+ * @returns {number} exit code
+ */
+function runCli(args, { raw = false } = {}) {
+  if (!existsSync(CLI_BIN)) {
+    console.error(`✖ playwright-cli not installed at ${CLI_BIN}`);
+    console.error(`  Run \`npm install\` inside the ss tool directory (${TOOL_DIR}).`);
+    return 1;
+  }
+  const session = cliSessionName();
+  const fullArgs = raw ? args : [`-s=${session}`, ...args];
+  const res = spawnSync(CLI_BIN, fullArgs, {
+    stdio: 'inherit',
+    env: { ...process.env, PLAYWRIGHT_CLI_SESSION: session },
+  });
+  return res.status ?? 1;
+}
+
+/**
+ * Boot a persistent CLI session pointed at the proxy URL.
+ * Non-blocking — the CLI daemonizes the browser process. Returns a teardown
+ * function the SIGINT handler can call.
+ *
+ * @param {string} proxyUrl - The full URL (localhost + path) the session opens
+ * @returns {() => void} teardown
+ */
+function bootCliSession(proxyUrl) {
+  if (!existsSync(CLI_BIN)) {
+    console.warn(`  ⚠ playwright-cli not found — AI DOM inspection disabled.`);
+    console.warn(`    Run \`npm install\` in ${TOOL_DIR} to enable \`ss snapshot\`.`);
+    return () => {};
+  }
+  const session = cliSessionName();
+  console.log(`  Booting playwright-cli session: ${session}`);
+  const child = spawn(
+    CLI_BIN,
+    [`-s=${session}`, 'open', proxyUrl, '--persistent'],
+    { stdio: 'ignore', detached: true, env: { ...process.env, PLAYWRIGHT_CLI_SESSION: session } },
+  );
+  child.unref();
+
+  const cfg = loadConfig();
+  saveConfig({ ...cfg, cliSession: session });
+
+  return () => {
+    try {
+      spawnSync(CLI_BIN, [`-s=${session}`, 'close'], { stdio: 'ignore', timeout: 5000 });
+    } catch {}
+  };
+}
+
+/**
+ * Prompt yes/no on the terminal, defaulting to yes. Returns false immediately
+ * if neither stdin nor stdout is a TTY (piped, nohup, CI) so `ss connect`
+ * doesn't hang. `process.stdin.isTTY` is only set when stdin is a real
+ * terminal — for socket-attached environments it's undefined (falsy), so
+ * we also check stdout.isTTY as a fallback signal that a terminal is present.
+ */
+function promptYes(question) {
+  const hasTty = process.stdin.isTTY || process.stdout.isTTY;
+  if (!hasTty) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    // Blank line first so the prompt isn't lost in boot noise.
+    process.stdout.write('\n');
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(`${question} [Y/n] `, (ans) => {
+      rl.close();
+      const a = (ans || '').trim().toLowerCase();
+      resolve(a === '' || a === 'y' || a === 'yes');
+    });
+  });
+}
+
+/**
+ * Give the CLI daemon a moment to open the browser + finish initial navigation
+ * before we ask it for a snapshot. The CLI reports "browser not open" if we
+ * fire snapshot before `open` completes.
+ */
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 // ─── Config helpers ───────────────────────────────────────────────────────────
 // .ss-config.json remembers your active test and target URL between sessions
@@ -59,6 +162,8 @@ program
   .description('Start proxy + watcher, capture page context, and open the site in your browser')
   .option('-t, --test <name>', 'Test name to use (defaults to last used test)')
   .option('-p, --port <number>', 'Port to run on', '3000')
+  .option('-s, --snapshot', 'Skip the prompt and take a snapshot right after connect')
+  .option('--no-snapshot', 'Skip the prompt and do not take a snapshot')
   .action(async (url, options) => {
     const config = loadConfig();
     const testName = options.test || config.activeTest;
@@ -77,6 +182,10 @@ program
     }
 
     // Detect bot protection (Cloudflare, etc.) with a quick headless probe.
+    // Cloudflare doesn't always render its challenge on the initial navigation
+    // — sometimes it just returns 403/503 with cf-mitigated + cf-ray headers
+    // and lets JS on the page finish the challenge later. So check the
+    // response object too, not just the rendered body.
     let usePW = false;
     try {
       const { chromium } = await import('playwright');
@@ -84,10 +193,17 @@ program
       const probe = await chromium.launch({ headless: true });
       const ctx = await probe.newContext();
       const pg = await ctx.newPage();
-      await pg.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      const response = await pg.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
       await new Promise(r => setTimeout(r, 3000));
       const bodyText = await pg.evaluate(() => document.body.innerText);
-      usePW = /security verification|checking your browser|just a moment/i.test(bodyText);
+      const respStatus = response?.status() ?? 200;
+      const respHeaders = response?.headers() ?? {};
+      const cfMitigated = 'cf-mitigated' in respHeaders;
+      const cfRay = 'cf-ray' in respHeaders;
+      const cfServer = /cloudflare/i.test(respHeaders['server'] || '');
+      const blockedStatus = respStatus === 403 || respStatus === 503;
+      const challengeText = /security verification|checking your browser|just a moment/i.test(bodyText);
+      usePW = challengeText || cfMitigated || (blockedStatus && (cfRay || cfServer));
 
       if (!usePW) {
         // No challenge — check for redirects (e.g. opb.org → www.opb.org)
@@ -99,7 +215,10 @@ program
         }
         console.log('  ✔ No bot protection detected');
       } else {
-        console.log('  ⚠ Bot protection detected — will use Playwright bypass');
+        const reason = challengeText ? 'challenge text'
+          : cfMitigated ? 'cf-mitigated header'
+          : `HTTP ${respStatus} with CF markers`;
+        console.log(`  ⚠ Bot protection detected (${reason}) — will use Playwright bypass`);
       }
       await probe.close();
     } catch (err) {
@@ -154,10 +273,6 @@ program
       console.log('  Launching stealth browser to bypass Cloudflare...');
       await pwFetcher.init(url);
 
-      // Clean up Playwright on exit
-      const cleanup = async () => { await pwFetcher.close(); };
-      process.on('SIGINT', async () => { await cleanup(); process.exit(0); });
-
       // Pass CF cookies to capture so screenshots work on protected sites
       const cookies = await pwFetcher.getCookies();
 
@@ -167,14 +282,9 @@ program
         capturePageContext(url, testName, { cookies }),
       ]);
 
-      // Open the proxied site at the original path
-      const openCmd = process.platform === 'darwin' ? 'open'
-        : process.platform === 'win32' ? 'start' : 'xdg-open';
-      exec(`${openCmd} http://localhost:${port}${targetPath}`);
-
+      var proxyUrl = `http://localhost:${port}${targetPath}`;
+      var extraCleanup = async () => { await pwFetcher.close(); };
       console.log(`  Edit tests/${testName}/${activeVariation}/variation.js to write your test.`);
-      console.log('  Ask your AI: "Based on ss-context/page.md, [what you want]"');
-      console.log('  Press Ctrl+C to stop.\n');
 
     } else {
       // ── Standard proxy mode ──────────────────────────────────────────────
@@ -184,16 +294,63 @@ program
         capturePageContext(url, testName),
       ]);
 
-      // Open the proxied site at the original path
-      const openCmd = process.platform === 'darwin' ? 'open'
-        : process.platform === 'win32' ? 'start' : 'xdg-open';
-      exec(`${openCmd} http://localhost:${port}${targetPath}`);
-
+      var proxyUrl = `http://localhost:${port}${targetPath}`;
+      var extraCleanup = async () => {};
       console.log(`  Edit tests/${testName}/${activeVariation}/variation.js to write your test.`);
-      console.log('  Ask your AI: "Based on ss-context/page.md, [what you want]"');
-      console.log('  Press Ctrl+C to stop.\n');
     }
 
+    // Snapshot decision: --snapshot / --no-snapshot skip the prompt,
+    // otherwise ask. Prompt runs BEFORE browser-open and CLI-boot so the
+    // readline prompt isn't clobbered by proxy [PW] GET log lines on the
+    // same TTY row. Non-TTY (piped, nohup, CI) skips silently.
+    let takeSnapshot;
+    if (options.snapshot === true) takeSnapshot = true;
+    else if (options.snapshot === false) takeSnapshot = false;
+    else takeSnapshot = await promptYes('  Take a snapshot now for AI DOM inspection?');
+
+    // Boot the CLI daemon + open the user's browser now that the prompt
+    // (if any) is done.
+    const cliTeardown = bootCliSession(proxyUrl);
+    const cleanup = async () => {
+      cliTeardown();
+      await extraCleanup();
+      process.exit(0);
+    };
+    process.on('SIGINT', cleanup);
+    process.on('SIGTERM', cleanup);
+    process.on('SIGHUP', cleanup);
+
+    const openCmd = process.platform === 'darwin' ? 'open'
+      : process.platform === 'win32' ? 'start' : 'xdg-open';
+    exec(`${openCmd} ${proxyUrl}`);
+
+    if (takeSnapshot) {
+      // Let the CLI daemon finish opening + navigating before we ask for
+      // a snapshot — otherwise it reports "browser not open" or hits a
+      // load-event timeout. 6s covers most SPAs; slow-loading sites may
+      // need `ss snapshot` re-run manually.
+      await sleep(6000);
+      runCli(['snapshot']);
+    } else {
+      console.log('  AI DOM inspection: `ss snapshot` (writes YAML to disk)');
+    }
+
+    // Kickoff prompt — a paste-ready line the user can drop into their AI
+    // agent to start iterating on the test.
+    console.log('');
+    console.log('  ── Kickoff prompt for your AI ──────────────────────────────────');
+    const promptFile = takeSnapshot
+      ? 'the latest file in `.playwright-cli/page-*.yml`'
+      : '`.playwright-cli/` (run `ss snapshot` first if empty)';
+    console.log(
+      `  Read ${promptFile} to see the DOM. My variation code goes in ` +
+      `\`tests/${testName}/${activeVariation}/variation.js\` and CSS in ` +
+      `\`index.css\` next to it. From here, I want to [what you're building].`,
+    );
+    console.log('  Use `ss snapshot` / `ss click <ref>` / `ss fill <ref> <text>` to interact.');
+    console.log('  ────────────────────────────────────────────────────────────────');
+    console.log('');
+    console.log('  Press Ctrl+C to stop.\n');
     process.stdin.resume();
   });
 
@@ -303,6 +460,56 @@ program
     await buildAll();
   });
 
+// ─── ss snapshot / click / fill / goto / browser / dash ──────────────────────
+// Thin wrappers around @playwright/cli scoped to the project session.
+// The CLI hits localhost:3000 (the proxy) so snapshots reflect the injected
+// variation. Use these as the AI-agent DOM interface — YAML on disk, no
+// context bloat. `ss browser` is a raw passthrough for anything the wrappers
+// don't cover (state-save, state-load, type, close, etc.).
+
+program
+  .command('snapshot')
+  .description('Write an accessibility-tree YAML snapshot of the proxied page to disk')
+  .action(() => {
+    process.exit(runCli(['snapshot']));
+  });
+
+program
+  .command('click <ref>')
+  .description('Click the element with the given snapshot ref')
+  .action((ref) => {
+    process.exit(runCli(['click', ref]));
+  });
+
+program
+  .command('fill <ref> <text>')
+  .description('Fill an input with the given snapshot ref')
+  .action((ref, text) => {
+    process.exit(runCli(['fill', ref, text]));
+  });
+
+program
+  .command('goto <path>')
+  .description('Navigate the CLI session to a new path on the proxy')
+  .action((path) => {
+    process.exit(runCli(['goto', path]));
+  });
+
+program
+  .command('browser [args...]')
+  .description('Passthrough to playwright-cli, scoped to the project session')
+  .allowUnknownOption(true)
+  .action((args = []) => {
+    process.exit(runCli(args));
+  });
+
+program
+  .command('dash')
+  .description('Open the playwright-cli live session dashboard')
+  .action(() => {
+    process.exit(runCli(['show'], { raw: true }));
+  });
+
 // ─── ss man ───────────────────────────────────────────────────────────────────
 
 program
@@ -319,30 +526,42 @@ program
   ────────
   1. ss connect <url> --test <name>
        Proxy starts at localhost:3000 mirroring the live site.
-       Page context saved to ss-context/ for your AI assistant.
+       Screenshots saved to ss-context/ for visual reference.
+       A playwright-cli session boots against the proxy for AI DOM inspection.
 
   2. Edit tests/<name>/v1/variation.js
        Write plain JS — no wrapper needed. Save to rebuild.
 
-  3. Ask your AI (Copilot, Cursor, Claude, etc.):
-       "Based on ss-context/page.md, add a sticky bar..."
-       Paste the output into variation.js.
+  3. Ask your AI (Copilot, Cursor, Claude Code, etc.):
+       "Run ss snapshot and inspect the DOM, then update variation.js to..."
+       AI reads YAML from disk on demand — no context bloat.
 
   4. ss build  →  dist/<name>.js
        Paste into Optimizely / VWO / Convert to go live.
 
   COMMANDS
   ────────
-  ss connect <url>               Start proxy + watcher
+  ss connect <url>               Start proxy + watcher + CLI session
     --test, -t <name>            Test to use (auto-created if missing)
     --port, -p <number>          Port to run on (default: 3000)
+    --snapshot, -s               Take a snapshot right after boot, no prompt
+    --no-snapshot                Skip the snapshot prompt entirely
 
   ss new <test-name>             Scaffold a new test folder
   ss variation                   Create a new variation for the active test
-  ss capture [url]               Re-capture page context (screenshots + HTML)
+  ss capture [url]               Re-capture screenshots + page.md
   ss list                        Show all tests, mark active one
   ss build                       Bundle all tests to dist/ (minified)
   ss man                         Show this reference
+
+  AI-AGENT COMMANDS (via @playwright/cli, scoped to project session)
+  ─────────────────────────────────────────────────────────────────
+  ss snapshot                    Write accessibility YAML to disk, print path
+  ss click <ref>                 Click by snapshot ref
+  ss fill <ref> <text>           Fill input by snapshot ref
+  ss goto <path>                 Navigate the CLI session to a new path
+  ss browser <...args>           Raw passthrough to playwright-cli
+  ss dash                        Open the live-session dashboard
 
   TEST FOLDER
   ───────────
@@ -358,7 +577,7 @@ program
     desktop.png  ← full-page screenshot at 1440px
     tablet.png   ← full-page screenshot at 768px
     mobile.png   ← full-page screenshot at 375px
-    page.md      ← reference when prompting your AI assistant
+    page.md      ← workflow pointer — DOM lives in ss snapshot output
 
   INSTALL
   ───────
