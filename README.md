@@ -1,13 +1,13 @@
 # start-scripting
 
-Local dev tool for building A/B tests on live websites. Write test code in your IDE, see it run on the live site instantly.
+Local dev tool for building A/B tests on live websites. Write test code in your IDE, see it run on the live site instantly, and let your AI agent drive the mirrored page directly through the terminal.
 
 ## How it works
 
-1. `ss connect <url>` starts a proxy at `localhost:3000` that mirrors any live site
-2. Your local JS/CSS is automatically injected into every page
-3. Save a file → page rebuilds and refreshes instantly
-4. Page context (full-page screenshots at desktop/tablet/mobile + HTML + CSS) is saved to `ss-context/` so you can prompt your AI assistant (Copilot, Cursor, Claude, etc.) to generate test code
+1. `ss connect <url>` starts a proxy at `localhost:3000` that mirrors any live site (including Cloudflare-protected ones).
+2. Your local JS/CSS is auto-injected into every page. Save → rebuild → refresh.
+3. `ss connect` also boots a persistent `@playwright/cli` browser session pointed at the proxy, so your AI agent can inspect and drive the page from the command line.
+4. Three viewport screenshots (`desktop.png`/`tablet.png`/`mobile.png`) are captured on connect for visual reference.
 
 ## Install
 
@@ -20,50 +20,78 @@ npm install
 npm link
 ```
 
-This installs the `ss` command globally. The first time you run `ss connect`, Chromium will be downloaded automatically (~100MB, one time).
+This installs the `ss` command globally. The first time you run `ss connect`, Chromium will be downloaded automatically (~100MB, one-time).
 
 ## Quickstart
 
 ```bash
-# Navigate to any project
 cd ~/projects/client-site/
 
-# Connect to a live site (auto-creates the test folder)
 ss connect https://client-site.com --test homepage-hero
-
-# localhost:3000 opens in your browser, mirroring the live site
-# Edit tests/homepage-hero/v1/variation.js — the page refreshes on every save
+# → probes for bot protection
+# → starts proxy at localhost:3000
+# → captures screenshots to ss-context/
+# → boots the CLI browser session
+# → prompts: "Take a snapshot now for AI DOM inspection? [Y/n]"
+# → opens the site in your browser and starts esbuild in watch mode
 ```
+
+Edit `tests/homepage-hero/v1/variation.js` — the page refreshes on every save.
 
 ## AI-assisted development
 
-When `ss connect` runs, it saves context files to `ss-context/`:
+The tool is designed around a coding-agent-in-terminal workflow (Claude Code, Cursor, Copilot, etc.). Instead of dumping a static HTML dump into a context file, the agent drives a live browser session with these wrappers:
 
-- `desktop.png` — full-page screenshot at 1440px
-- `tablet.png` — full-page screenshot at 768px
-- `mobile.png` — full-page screenshot at 375px
-- `page.md` — HTML structure + CSS design tokens
+```
+ss snapshot           Write an accessibility-tree YAML snapshot to disk. Prints the file path.
+ss click <ref>        Click by ref from the latest snapshot.
+ss fill <ref> <text>  Fill an input by ref.
+ss goto <path>        Navigate the CLI browser to a new path on the proxy.
+ss browser <...args>  Raw passthrough to playwright-cli (type, hover, select, press, eval, ...).
+ss dash               Open the live CLI session dashboard.
+```
 
-Run `ss capture` at any time to refresh these files. Open `ss-context/page.md` in your IDE and ask your AI assistant:
+`ss connect` prints a **kickoff prompt** on completion. Paste it into your agent, fill in what you're building, and go:
 
-> "Based on ss-context/page.md, add a sticky announcement bar at the top that matches the site's colors"
+> Read the latest file in `.playwright-cli/page-*.yml` to see the DOM. My variation code goes in `tests/homepage-hero/v1/variation.js` and CSS in `index.css` next to it. From here, I want to \[build a sticky announcement bar\].
 
-Paste the generated code into `v1/variation.js` → the proxy rebuilds → the change appears on the live site.
+The loop the agent uses is `snapshot → find ref → act → snapshot → verify`. Refs are ephemeral (they change every snapshot), so the agent always snapshots fresh before acting.
+
+**A few flags worth knowing:**
+
+- `ss connect <url> -s` — skip the prompt and always snapshot after boot.
+- `ss connect <url> --no-snapshot` — skip the prompt and never snapshot.
+- Non-TTY invocations (`nohup`, CI, piped) skip the prompt silently.
+
+**Can the agent run `ss capture` or `ss variation`?** Yes — every `ss` subcommand is available to the agent. Common ones the agent might reach for:
+
+- `ss capture` — regenerate screenshots after the site content changed.
+- `ss variation` — spin up a fresh `v2` and switch to it before proposing an alternative.
+- `ss browser eval "() => document.title"` — evaluate arbitrary JS on the CLI page.
 
 ## Commands
 
 ```
-ss connect <url>               Start proxy + watcher for a live site
-ss connect <url> --test <name> Connect with a specific test name
-ss connect <url> --port <n>    Run on a custom port (default: 3000)
+ss connect <url>                     Start proxy + watcher + CLI session
+  --test, -t <name>                    Test to use (auto-created if missing)
+  --port, -p <n>                       Port to run on (default: 3000)
+  --snapshot, -s                       Skip the prompt and auto-snapshot after boot
+  --no-snapshot                        Skip the prompt entirely
 
-ss new <test-name>             Create a new test folder manually
-ss variation                   Create a new variation for the active test
-ss capture [url]               Re-capture page context (screenshots + HTML)
-ss list                        Show all tests and which is active
-ss build                       Bundle all tests to dist/ for deployment
+ss new <test-name>                   Scaffold a new test folder
+ss variation                         Create a new variation for the active test
+ss capture [url]                     Re-capture screenshots + page.md
+ss list                              Show all tests and which is active
+ss build                             Bundle every test to dist/ for deployment
 
-ss man                         Show the full command reference
+ss snapshot                          AI: write DOM YAML to disk, print path
+ss click <ref>                       AI: click by snapshot ref
+ss fill <ref> <text>                 AI: fill an input by snapshot ref
+ss goto <path>                       AI: navigate the CLI browser
+ss browser <...args>                 AI: raw playwright-cli passthrough
+ss dash                              Open the live-session dashboard
+
+ss man                               Full inline reference
 ```
 
 ## Test structure
@@ -74,12 +102,12 @@ Each test lives in `tests/<name>/`:
 tests/
   my-test/
     v1/
-      variation.js ← write your code here (no wrapper needed)
-      index.css    ← styles (auto-injected as a <style> tag)
-      index.html   ← optional HTML injected before </body>
+      variation.js  ← write your code here (no wrapper needed)
+      index.css     ← styles (auto-injected as a <style> tag)
+      index.html    ← optional HTML injected before </body>
 ```
 
-`variation.js` is plain JavaScript — no function wrapper needed. The DOM is ready when it runs.
+`variation.js` is plain JavaScript — no function wrapper. The DOM is ready when it runs.
 
 ```js
 // variation.js example
@@ -89,7 +117,7 @@ if (hero) hero.textContent = 'New Headline';
 
 ## Variations
 
-Run `ss variation` to create a new variation (v2, v3, ...) copied from the current one. The proxy switches to the new variation immediately.
+Run `ss variation` to create a new variation (v2, v3, ...) copied from the current one. The proxy switches to it immediately.
 
 ```bash
 ss variation
@@ -97,9 +125,11 @@ ss variation
 # → edit tests/my-test/v2/variation.js
 ```
 
+The proxied page also shows a small variation-switcher widget in the corner when more than one variation exists.
+
 ## Optional HTML injection
 
-Add any HTML to `tests/<name>/<variation>/index.html` and it will be injected before `</body>` on every proxied page. Useful for modals, overlays, or any markup your test needs:
+Add markup to `tests/<name>/<variation>/index.html` and it's injected before `</body>` on every proxied page — useful for modals, overlays, or any structural markup your test needs:
 
 ```html
 <!-- tests/my-test/v1/index.html -->
@@ -117,32 +147,30 @@ ss build
 # → dist/my-test.js (minified, self-contained)
 ```
 
-Paste the contents of `dist/my-test.js` into your A/B testing platform (Optimizely, VWO, Convert, etc.) or load it via a `<script>` tag.
+Paste `dist/my-test.js` into your A/B testing platform (Optimizely, VWO, Convert) or load it via a `<script>` tag.
+
+## Cloudflare / bot-protected sites
+
+`ss connect` probes for bot protection (checks `cf-mitigated`, `cf-ray`, and response status). If detected, it launches a stealth Playwright browser to clear the challenge, then serves every request — HTML *and* sub-resources — through the CF-cleared browser context so the mirrored page renders same-origin from `localhost:3000` (no CORS, no CSP breakage).
+
+If Cloudflare requires human verification (Turnstile, CAPTCHA), a small headed window opens for you to solve it once. The cookies are then reused for the rest of the session.
 
 ## Testing locally (contributing)
 
-To work on `ss` itself without reinstalling after every change:
-
 ```bash
-# 1. Clone the repo
 git clone https://github.com/garrett-a/start-scripting.git ~/projects/ss
 cd ~/projects/ss
 npm install
-
-# 2. Link it globally so the `ss` command runs your local copy
 npm link
 
-# 3. Make a throwaway project to test against
 mkdir /tmp/ss-test && cd /tmp/ss-test
-
-# 4. Run commands directly from your clone — changes take effect immediately
 ss new my-test
 ss connect https://example.com --test my-test
 ```
 
-Because `npm link` points the global `ss` binary at your clone, any edits to files in `src/` or `bin/` are picked up the next time you run a command — no reinstall needed.
+`npm link` points the global `ss` binary at your clone, so edits to `src/` or `bin/` take effect on the next invocation — no reinstall.
 
-To unlink when you're done:
+Unlink when done:
 
 ```bash
 npm unlink -g start-scripting
